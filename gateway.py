@@ -1,99 +1,52 @@
 # gateway.py
-# --------------------------------------------
-# Gateway: acts as server broadcasting prices (GBM) and news sentiment.
-# Two TCP servers:
-#   - 7001: price stream
-#   - 7002: sentiment stream
-# --------------------------------------------
+import os, socket, threading, time, json, random
 
-import socket
-import threading
-import time
-import random
-import math
+HOST = os.getenv("GATEWAY_HOST", "127.0.0.1")
+PRICE_PORT = int(os.getenv("GATEWAY_PRICE_PORT", "5001"))
+NEWS_PORT  = int(os.getenv("GATEWAY_NEWS_PORT",  "5002"))
+MESSAGE_DELIMITER = os.getenv("MESSAGE_DELIMITER", "*").encode()
+SYMS = os.getenv("SYMBOLS", "AAPL,MSFT,GOOG,AMZN").split(",")
 
-HOST = "localhost"
-PRICE_PORT = 7001
-NEWS_PORT = 7002
-MESSAGE_DELIMITER = b"*"
-PRICE_UPDATE_INTERVAL = 0.1
-
-SYMBOLS = ["AAPL", "MSFT", "AMZN"]
-
-# GBM parameters
-MU = 0.0001
-SIGMA = 0.01
-DT = PRICE_UPDATE_INTERVAL
-
-def handle_price_client(conn, addr, prices):
-    """Send GBM-based prices continuously."""
-    print(f"[PRICE] Client connected from {addr}")
+def _listen(port, backlog=128):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # important on macOS
     try:
-        while True:
-            for sym in SYMBOLS:
-                z = random.gauss(0, 1)
-                drift = (MU - 0.5 * SIGMA**2) * DT
-                diffusion = SIGMA * (DT**0.5) * z
-                prices[sym] *= math.exp(drift + diffusion)
+        s.bind((HOST, port))
+    except OSError as e:
+        # surface the port value for easier debugging
+        raise RuntimeError(f"gateway bind failed on {HOST}:{port}: {e}") from e
+    s.listen(backlog)
+    return s
 
-            msg = b"".join(
-                f"{sym},{prices[sym]:.2f}".encode() + MESSAGE_DELIMITER
-                for sym in SYMBOLS
-            )
-            conn.sendall(msg)
-            time.sleep(PRICE_UPDATE_INTERVAL)
-    except (BrokenPipeError, ConnectionResetError):
-        print(f"[PRICE] Client {addr} disconnected.")
-    finally:
-        conn.close()
+def _serve_prices():
+    srv = _listen(PRICE_PORT)
+    def handle(conn):
+        with conn:
+            prices = {sym: 100.0 for sym in SYMS}
+            while True:
+                sym = random.choice(SYMS)
+                prices[sym] += random.uniform(-0.2, 0.2)
+                msg = {"type":"price","sym":sym,"px":round(prices[sym],4),"ts":time.time()}
+                conn.sendall(json.dumps(msg).encode() + MESSAGE_DELIMITER)
+                time.sleep(0.01)
+    while True:
+        c, _ = srv.accept()
+        threading.Thread(target=handle, args=(c,), daemon=True).start()
 
-def price_server():
-    prices = {sym: random.uniform(100, 300) for sym in SYMBOLS}
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind((HOST, PRICE_PORT))
-        s.listen()
-        print(f"[PRICE] Server started on port {PRICE_PORT}")
-        while True:
-            conn, addr = s.accept()
-            threading.Thread(target=handle_price_client, args=(conn, addr, prices), daemon=True).start()
+def _serve_news():
+    srv = _listen(NEWS_PORT)
+    def handle(conn):
+        with conn:
+            while True:
+                msg = {"type":"news","sentiment": random.randint(0,100), "ts": time.time()}
+                conn.sendall(json.dumps(msg).encode() + MESSAGE_DELIMITER)
+                time.sleep(0.2)
+    while True:
+        c, _ = srv.accept()
+        threading.Thread(target=handle, args=(c,), daemon=True).start()
 
-def handle_news_client(conn, addr):
-    print(f"[NEWS] Client connected from {addr}")
-    try:
-        while True:
-            sentiment = random.randint(0, 100)
-            msg = f"NEWS,{sentiment}".encode() + MESSAGE_DELIMITER
-            conn.sendall(msg)
-            time.sleep(0.5)
-    except (BrokenPipeError, ConnectionResetError):
-        print(f"[NEWS] Client {addr} disconnected.")
-    finally:
-        conn.close()
-
-def news_server():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind((HOST, NEWS_PORT))
-        s.listen()
-        print(f"[NEWS] Server started on port {NEWS_PORT}")
-        while True:
-            conn, addr = s.accept()
-            threading.Thread(target=handle_news_client, args=(conn, addr), daemon=True).start()
-
-def main():
-    """Run both price and news servers concurrently."""
-    threading.Thread(target=price_server, daemon=True).start()
-    threading.Thread(target=news_server, daemon=True).start()
-    print("[Gateway] Running both servers.")
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\n[Gateway] Shutting down.")
-        
 def run_gateway():
-    main()
-
-if __name__ == "__main__":
-    main()
+    t1 = threading.Thread(target=_serve_prices, daemon=True)
+    t2 = threading.Thread(target=_serve_news,   daemon=True)
+    t1.start(); t2.start()
+    t1.join(); t2.join()
